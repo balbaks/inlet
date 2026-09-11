@@ -70,13 +70,25 @@ def test_unresolvable_function_param_is_uncertain():
     assert classify_expr(name_expr, func, call.lineno) == "uncertain"
 
 
-def test_builder_execute_not_sql_is_excluded():
-    """The peewee false positive from EVALUATION.md: Query.execute(database)
-    and database.execute(query) both take a connection/database object, not
-    SQL text, and neither receiver is cursor/connection-like. Must produce
-    no findings at all - not even uncertain, since there's no evidence
-    either call is a database call in the first place."""
-    assert scan(FIXTURES / "builder_execute_not_sql.py") == []
+def test_builder_execute_not_sql_is_uncertain():
+    """The peewee shape from EVALUATION.md: Query.execute(database) and
+    database.execute(query) both take a connection/database object, not
+    SQL text, and neither receiver is cursor/connection-like. As of
+    v0.1.2 this must come back `uncertain` for both calls - not excluded
+    (v0.1.1's behavior, reverted for silently dropping 94 real findings
+    elsewhere) and not a confident parameterized/concatenated guess
+    either. See EVALUATION.md's "v0.1.1 -> v0.1.2, a reverted attempt"."""
+    assert _verdicts("builder_execute_not_sql.py") == ["uncertain", "uncertain"]
+
+
+def test_generic_receiver_non_string_arg_is_uncertain_not_excluded():
+    """The exact real-world shape v0.1.1 silently dropped (Django's
+    SchemaEditor.execute(sql), among 94 others): a genuine DB wrapper
+    method named generically (`self`), called with an argument that isn't
+    locally resolvable to a string. Must be reported as `uncertain`,
+    visibly - never silently excluded, and never guessed at as a confident
+    verdict either."""
+    assert _verdicts("self_execute_unresolvable_uncertain.py") == ["uncertain"]
 
 
 def test_builder_execute_with_string_arg_still_caught():
@@ -112,10 +124,12 @@ def test_cursor_call_chain_is_recognized_even_with_unresolvable_arg():
 
 
 def test_execute_with_no_receiver_evidence_is_flagged_accordingly():
-    """Detection itself still finds the call site (that's still just a
-    name match) - the receiver_is_cursor_like flag is what tells core.scan()
-    whether an eventual 'uncertain' verdict is worth keeping. See
-    test_builder_execute_not_sql_is_excluded for the end-to-end behavior."""
+    """Detection still finds the call site and still records whether the
+    receiver looks cursor-like - that metadata is informational only as of
+    v0.1.2 (see core.py) and must never cause core.scan() to drop the
+    finding. See test_builder_execute_not_sql_is_uncertain and
+    test_generic_receiver_non_string_arg_is_uncertain_not_excluded for the
+    end-to-end behavior this metadata must not affect."""
     import ast
 
     from inlet.detectors import find_candidates

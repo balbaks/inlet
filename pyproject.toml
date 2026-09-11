@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inlet"
-version = "0.1.1"
+version = "0.1.2"
 description = "Maps database-access call sites in a Python codebase and classifies each by risk shape: parameterized, concatenated, or uncertain."
 readme = "README.md"
 requires-python = ">=3.10"

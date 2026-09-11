@@ -110,15 +110,19 @@ laziness.
 `.execute(...)`/`.raw(...)`/`.extra(...)` calls are matched by name alone,
 which real code sometimes reuses for something that isn't SQL (peewee's
 own `Query.execute(database)` takes a connection object, not a query — see
-`EVALUATION.md`). Since v0.1.1, a call that resolves to `uncertain` is only
-reported if there's positive evidence the receiver is actually a DB
-cursor/connection/session (an explicit `.cursor()` in the chain, or a
-conventional name like `cursor`/`conn`/`session`); otherwise it's dropped
-rather than reported as a guess. This measurably fixes false positives on
-some real code and measurably drops some real (if already low-confidence)
-findings on other real code where the same wrapper method is named
-something generic like `self` — `EVALUATION.md`'s "Post-fix delta" section
-has the exact, unspun numbers both ways.
+`EVALUATION.md`). When neither the argument nor the receiver gives any
+evidence either way, `inlet` reports `uncertain` — visibly, in the output —
+rather than guessing in either direction. It briefly did something
+different: v0.1.1 excluded such a call from output entirely whenever the
+receiver wasn't a recognized cursor/connection/session name. That traded
+24 confirmed false positives in peewee for 94 real DB call sites silently
+missing from output elsewhere (Django's `SchemaEditor.execute()`,
+SQLAlchemy's own `Engine`/`Session` internals, and more) — a strictly worse
+trade, since a noisy `uncertain` finding is something a person can dismiss
+and a finding that was never reported is not. Reverted in v0.1.2.
+`EVALUATION.md`'s "v0.1.1 → v0.1.2, a reverted attempt" section has the
+full accounting, including why no name-based heuristic can safely make
+that call.
 
 ## Usage
 
@@ -144,10 +148,11 @@ Findings print grouped by verdict, risky (`concatenated`) first.
 
 Every classification rule is asserted by test, not eyeballed:
 [`tests/test_classification.py`](tests/test_classification.py) runs
-against ten fixtures covering every idiom family, both the safe and risky
-shapes, the cross-function wall case, and (since v0.1.1) the
-execute-name-collision exclusion and its true-positive-preservation
-counterpart.
+against eleven fixtures covering every idiom family, both the safe and
+risky shapes, the cross-function wall case, and the receiver-ambiguity
+case — a real-shaped `.execute()`/`.raw()`/`.extra()` call with no evidence
+either way, which must land in `uncertain`: not a confident guess, and
+(since v0.1.2) never silently dropped either.
 
 ```console
 $ pip install -e .

@@ -21,6 +21,13 @@ class Candidate:
     # _receiver_is_cursor_like. Always True for sqlalchemy_text, since a
     # bare `text(...)` call has no receiver to judge and no known
     # same-named-but-unrelated API to collide with.
+    #
+    # This is metadata only - core.py must never use its absence to drop a
+    # finding. v0.1.1 did exactly that (excluding "uncertain" candidates
+    # with no receiver evidence) to fix a real false-positive pattern in
+    # peewee, and it silently dropped 94 real DB call sites elsewhere as a
+    # side effect - reverted in v0.1.2. See EVALUATION.md's
+    # "v0.1.1 -> v0.1.2, a reverted attempt" section for the full story.
     receiver_is_cursor_like: bool
 
 
@@ -48,11 +55,14 @@ def _has_params_arg(call: ast.Call, extra_kw_names: tuple[str, ...] = ("params",
 # `execute`/`raw`/`extra` are common enough verbs that unrelated APIs reuse
 # them - peewee's Query.execute(database) takes a connection, not SQL text;
 # Django's BaseCommand.execute() is CLI dispatch, not a DB call. A bare
-# name match isn't evidence of a DB call by itself. This is corroborating
-# evidence, checked at candidate-collection time and consulted later by
-# core.py once classify_expr has had a chance to resolve the argument -
-# see the module docstring in core.py for why the check isn't applied here
-# directly.
+# name match isn't proof of a DB call by itself - but its *absence* isn't
+# proof of the opposite either. `self.execute(x)` is genuinely ambiguous
+# from local syntax alone whether `self` is Django's SchemaEditor or
+# peewee's Query: that's an irreducible limit of single-file AST analysis,
+# the same category as the cross-function scope wall, not a defect to
+# engineer around by excluding the ambiguous case. This set is corroborating
+# evidence only, recorded on the Candidate for callers who want it; it must
+# never be used to drop a finding from output (core.py's scan() doesn't).
 _CURSOR_LIKE_SEGMENTS = {"cursor", "cur", "curs", "conn", "con", "connection", "session"}
 
 

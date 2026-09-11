@@ -611,3 +611,151 @@ receiver `cursor` — squarely inside the convention list — so its
 not because of receiver evidence. Re-running Group A would not change any
 of the five verdicts, and re-scanning it here would risk implying this
 patch touched the structural wall, which it did not.
+
+## 6. v0.1.1 → v0.1.2, a reverted attempt
+
+This section is not a footnote to §5 — it's the more important outcome of
+the two, and it's kept as its own labeled section rather than folded
+quietly into the delta table above, because what got reverted and why
+matters more than the numbers in either version.
+
+**What v0.1.1 tried.** A candidate `.execute()`/`.raw()`/`.extra()` call
+that `classify_expr` still resolved to `uncertain` was dropped from output
+entirely — not reported at any verdict — unless the receiver gave positive
+evidence of being a cursor, connection, or ORM session (an explicit
+`.cursor()` call in the chain, or a name like `cursor`/`conn`/`session`).
+The intent was narrow and the peewee result was clean: it removed exactly
+24 confirmed false positives (`Query.execute(database)`-style calls, where
+the argument is a connection object, never SQL) and changed nothing else
+about peewee's output.
+
+**What it broke.** The same rule, applied uniformly (as a *general*
+AST-shape rule has to be — the whole point of avoiding package-specific
+special-casing), also silently dropped 94 real DB-execute call sites across
+the rest of Group B: Django's `SchemaEditor.execute()` (53 call sites,
+`django/db/backends/*/schema.py`), SQLAlchemy's own `Engine`/`Session`/
+scoping-proxy internals (27), `dataset`'s `self.executable.execute()` (8),
+SQLModel's `super().execute()` (3), and Alembic's `cls.execute()`/
+`operations.migration_context.impl.execute()`/`self.get_context().execute()`
+(3). None of those are false positives. They're real, if already
+low-confidence, `uncertain` findings that simply stopped existing in
+`inlet`'s output — not downgraded, not deprioritized, gone. §5's original
+writeup reported this size and shape honestly at the time, but reporting a
+regression accurately is not the same as it being the right behavior to
+ship, and on reflection it wasn't.
+
+**Why it was reverted.** The two failure modes are not symmetric, and
+v0.1.1 treated them as if they were. An `uncertain` finding that turns out
+to be noise costs a reader a few seconds — they read the line, see it's
+`self.execute(database)` inside a query builder, and move on. A finding
+that was never reported costs nothing to the reader and everything to
+whoever needed it: it cannot be dismissed, reconsidered, or found later by
+grepping the output, because it was never there. `inlet` reporting
+`self.execute(sql)` as `uncertain` on Django's `SchemaEditor` — sql
+unresolved, no promises made — is exactly what §1 of this document's
+"What this is not" section says `inlet` is for: a lead, not a verdict.
+Silently excluding it is a stronger claim than `inlet` is positioned to
+make: it asserts, with no real basis, that the call was safe to ignore.
+That's an availability failure dressed up as a precision improvement.
+
+This mirrors the fail-closed posture the rest of this tool collection
+already takes — secfix won't claim "fixed" without proof, husk's timeout
+kills a hung check rather than trusting it succeeded, witness names its
+ctypes blind spot loudly instead of pretending coverage it doesn't have.
+v0.1.1 was the same category of mistake in the opposite direction: it
+traded visible, recoverable noise for confident, unrecoverable silence.
+**The design principle, stated for future reference:** when a refinement's
+only available lever is "exclude the finding when the evidence is
+insufficient," that is not a lever this tool should pull, no matter how
+clean the motivating case looks in isolation. Downgrading confidence is
+fine. Removing the finding is not.
+
+**The real, irreducible finding — stated plainly, because it's the
+legitimate insight underneath the discarded fix.** `self.execute(x)` is
+genuinely, structurally ambiguous from where `inlet` sits, and no amount of
+tuning the receiver-name convention list fixes that. Django's
+`SchemaEditor.execute()`, SQLAlchemy's `Engine.execute()`, and peewee's
+`Query.execute()` are the *identical* AST shape: an attribute access named
+`execute`, called with a non-string-shaped argument, on a receiver named
+`self`. Nothing in the local syntax says which of those three `self`s wraps
+a real DB cursor two calls down and which is an unrelated builder object.
+Resolving it for real needs to know what class `self` is bound to —
+interprocedural, type-aware analysis, the same category of thing already
+named out of scope by the cross-function scope wall. This is not "a
+heuristic that needs more tuning." It's a hard limit of single-file AST
+analysis, and it belongs in `uncertain` — the verdict `inlet` already has
+for exactly this situation — not in a bespoke exclusion path invented to
+paper over it.
+
+**The fix, mechanically.** `core.py`'s `scan()` no longer drops any
+candidate based on `receiver_is_cursor_like`. Every `.execute()`/`.raw()`/
+`.extra()` call that `find_candidates` identifies is now reported, at
+whatever verdict `classify_expr` produces, exactly as in v0.1.0. The
+receiver-evidence detection itself (`detectors._receiver_is_cursor_like`)
+was kept, not deleted — it's still attached to every `Candidate` as
+metadata, still exercised by its own unit tests, and still available for a
+future *upgrade*-only use (e.g. surfacing high-confidence cursor evidence
+to a reader some other way) — it is just never consulted to remove a
+finding from output. The one part of v0.1.1 that *was* correct and stays:
+the "argument resolution before evidence check" ordering fix, which was
+needed to stop the gate (when it existed) from short-circuiting Django's
+`self.execute(sql)` where `sql` resolves via a straight-line `%`-format
+assignment one line up — `tests/fixtures/self_execute_resolved_concat_risky.py`
+still pins that down and still passes.
+
+`tests/fixtures/builder_execute_not_sql.py` (the peewee-shaped fixture) was
+rewritten in place rather than deleted: it now asserts both calls come back
+`uncertain`, not that they're excluded. A new fixture,
+`tests/fixtures/self_execute_unresolvable_uncertain.py`, models the other
+side directly — a genuine `SchemaEditor`-style DB wrapper with the same
+ambiguous shape — and asserts the same `uncertain` outcome, so the test
+suite pins down that both the false-positive-shaped and the
+true-positive-shaped versions of "generic receiver, unresolvable argument"
+land in the same honest place. 16 tests total, all passing; nothing from
+v0.1.0 or the valid part of v0.1.1 changed.
+
+**Group B re-scanned again, same 10 packages, same targets, v0.1.2:**
+
+| Package | uncertain (v0.1.0) | uncertain (v0.1.1) | uncertain (v0.1.2) |
+|---|---|---|---|
+| SQLAlchemy | 421 | 394 | **421** |
+| peewee | 33 | 9 | **33** |
+| records | 6 | 6 | **6** |
+| dataset | 11 | 3 | **11** |
+| SQLModel | 3 | 0 | **3** |
+| aiosqlite | 2 | 2 | **2** |
+| djangorestframework | 0 | 0 | **0** |
+| Flask-SQLAlchemy | 4 | 4 | **4** |
+| Alembic | 11 | 8 | **11** |
+| Django (patched) | 81 | 23 | **81** |
+| **Total** | **572** | **449** | **572** |
+
+**Report the actual peewee number plainly, without rounding toward either
+side: it's 33 — identical to v0.1.0, not something in between 9 and 33.**
+That's worth explaining rather than leaving as a surprising-looking result.
+The only mechanism that ever produced a confident `parameterized`/
+`concatenated` verdict was, and still is, `classify_expr` resolving the
+*argument* — a literal, an f-string, a `%`/`+`/`.format()` expression, or a
+Name that resolves to one of those in local scope. That mechanism was never
+touched by either the v0.1.1 patch or this revert; receiver naming was
+never part of it and still isn't. "Keep the receiver-evidence signal as an
+upgrade path" does not mean invented behavior where a cursor-like receiver
+name promotes an otherwise-unresolvable argument to a confident verdict —
+there's no principled basis for that (a `cursor`-named receiver says
+nothing about what an unresolvable argument actually contains), and adding
+it would be fabricating precision `inlet` doesn't have. With no such
+mechanism added, v0.1.2's classification behavior is, correctly, identical
+to v0.1.0's. A full diff (every finding line, not just the counts)
+confirms all 10 packages' output in v0.1.2 is byte-for-byte identical to
+the original pre-v0.1.1 baseline in §2. The 94 findings v0.1.1 dropped —
+Django's `SchemaEditor.execute()`, SQLAlchemy's `Engine`/`Session`
+internals, `dataset`'s `self.executable.execute()`, SQLModel's
+`super().execute()`, Alembic's DDL entry points — are confirmed back in
+the output as `uncertain`. peewee's 24 originally-misleading findings are
+also back as `uncertain` — visible again, exactly as intended: recoverable
+noise instead of unrecoverable silence, for everyone, not just for peewee.
+
+`concatenated` and `parameterized` counts are unaffected in every version
+of this story (v0.1.0, v0.1.1, and v0.1.2 all agree on them) — this was
+never about those two verdicts. The entire episode is contained to how
+`uncertain` candidates are reported, and v0.1.2 reports all of them.
