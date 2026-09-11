@@ -449,3 +449,165 @@ the next fix, respectively.
 - **This evaluation only tested `inlet scan` with default flags.** It did
   not exercise `--only`, the library API, or any code path other than
   directory scanning.
+
+## 5. Post-fix delta (v0.1.1)
+
+§3 identified two distinct problems. One was a fixable precision bug: the
+`execute`/`raw`/`extra` idioms matched on method name alone, so peewee's
+`Query.execute(database)` — where the argument is a `Database`/connection
+object, not SQL, and the receiver is a query-builder object, not a cursor —
+got swept in and reported as `uncertain`, inflating peewee's `uncertain`
+bucket by roughly two-thirds. The other was a structural wall (idiom-name
+coverage stopping at framework abstraction boundaries) that is **not**
+addressed here — see the new "Walls" section in `README.md`.
+
+**The fix.** `detectors.py` now records, for every `execute`/`raw`/`extra`
+candidate, whether the receiver gives positive evidence of being a DB-API
+cursor/connection or an ORM session: either an explicit `.cursor()` call in
+the chain, or a receiver whose terminal name segment is one of a small,
+spec-grounded set (`cursor`, `cur`, `curs`, `conn`, `con`, `connection`,
+`session` — PEP 249's and SQLAlchemy's own vocabulary, not any one
+package's). `core.py` then drops a finding only if *both* classify_expr
+still came back `uncertain` *and* that receiver evidence is absent — never
+for a `concatenated` or `parameterized` verdict, and never before
+classification has had a chance to resolve a bare Name through the same
+local-scope logic it always used. That ordering matters: an early
+implementation that gated on the *unresolved* argument shape at detection
+time broke Django's own `self.execute(sql)` pattern in
+`schema.py` (`sql = "..." % {...}` assigned one line above, then
+`self.execute(sql)`) — a real, previously-correct `concatenated` finding —
+because `self` isn't a conventional cursor name and the syntactic argument
+at the call site is a bare `Name`. That would have been exactly the kind of
+regression Part 1 said to treat as disqualifying. The fix was to gate on
+`classify_expr`'s output instead of the raw syntax, which is provably
+equivalent to the intended rule for every existing fixture and closes that
+hole; `tests/fixtures/self_execute_resolved_concat_risky.py` pins it down as
+a regression test.
+
+No idiom name and no package name appears in `_receiver_is_cursor_like`;
+the two new exclusion fixtures
+(`tests/fixtures/builder_execute_not_sql.py`,
+`tests/fixtures/builder_execute_string_arg_risky.py`) and the true-positive
+regression fixture above are the check that it stayed that way. All 7
+original fixtures pass unchanged; 8 new tests were added (15 total, all
+passing).
+
+**Group B re-scanned, patched version, same 10 packages, same targets:**
+
+| Package | uncertain before | uncertain after | net | concatenated before → after |
+|---|---|---|---|---|
+| SQLAlchemy | 421 | 394 | −27 | 26 → 26 (unchanged) |
+| peewee | 33 | **9** | **−24** | 8 → 8 (unchanged) |
+| records | 6 | 6 | 0 | 0 → 0 |
+| dataset | 11 | 3 | −8 | 0 → 0 |
+| SQLModel | 3 | 0 | −3 | 0 → 0 |
+| aiosqlite | 2 | 2 | 0 | 3 → 3 (unchanged) |
+| djangorestframework | 0 | 0 | 0 | 0 → 0 |
+| Flask-SQLAlchemy | 4 | 4 | 0 | 0 → 0 |
+| Alembic | 11 | 8 | −3 | 0 → 0 |
+| Django (patched) | 81 | 23 | −58 | 76 → 76 (unchanged) |
+| **Total** | **572** | **449** | **−123** | **113 → 113 (unchanged)** |
+
+`concatenated` and `parameterized` counts are identical, package for
+package, before and after — confirmed by diffing every finding line, not
+just spot-checked. The fix, as designed, only ever removes `uncertain`
+findings. records, aiosqlite, djangorestframework, and Flask-SQLAlchemy are
+byte-for-byte identical output before and after (confirmed by diff, not
+just matching counts).
+
+**The peewee result, stated plainly:** every one of the 24 removed peewee
+findings is the exact false-positive shape identified in §2/§3 —
+`database.execute(self)`, `self.execute(database)`,
+`self.database.execute(...)` (×10), `clone.execute(database)`,
+`child_query.execute(database)`, and similar, all confirmed by diff to be
+gone. Every one of the 9 remaining peewee `uncertain` findings is a real
+`cursor.execute(...)`/`self.cursor().execute(...)`/`conn.execute(...)` call
+with an unresolvable argument — confirmed by diff to be unchanged. No
+peewee true positive was lost. This is the fix working exactly as
+intended, on the exact package that motivated it.
+
+**Did the rule drop real findings elsewhere? Yes — substantially, and this
+needs to be said as plainly as the peewee result, not folded into a
+footnote.** A full diff (not a sample — the counts were small enough to
+enumerate completely) across all 10 packages found 99 removed findings
+outside peewee. Of those, 5 (in Django's `management/` tree —
+`createsuperuser.py`, `runserver.py`, `sqlmigrate.py`, `base.py`,
+`core/management/__init__.py`) are the same category of bonus, correct
+removal already noted in §2: Django's `BaseCommand.execute()` CLI dispatch,
+unrelated to SQL, collided with the same name.
+
+**The remaining 94 are real DB-execute call sites, not false positives,
+lost as a side effect of the same rule:**
+
+- **Django, 53 of the 58 removed:** `self.execute(sql)` /
+  `schema_editor.execute(sql)` / `super().execute(...)` throughout
+  `django/db/backends/*/schema.py` and `django/db/backends/base/schema.py`
+  — Django's `SchemaEditor.execute()` is a real, thin wrapper around
+  `self.connection.cursor().execute(sql, params)`, called from dozens of
+  DDL methods (`add_field`, `alter_db_table`, etc.) as `self.execute(...)`.
+  These are exactly the same real DB-execute calls documented as correctly
+  `concatenated` in §2's Django review, just the ones whose argument
+  didn't resolve to a string shape.
+- **SQLAlchemy, 27 removed:** `self.execute(...)` inside `Engine`/`Session`/
+  `Connection`'s own method bodies, plus `bind.execute`, `trans.execute`,
+  `subject.execute`, `rec.execute`, `action.execute`,
+  `self._proxied.execute` (async scoping proxies), and
+  `connection.execution_options(...).execute(...)` (an `Attribute` chain
+  whose immediate receiver is a `Call`, not a name, so it can't match
+  either evidence rule). All real.
+- **dataset, 8 removed:** `self.executable.execute(...)` /
+  `self.db.executable.execute(...)` — dataset's own name for its wrapped
+  SQLAlchemy `Engine`/`Connection`. Real.
+- **SQLModel, 3 removed:** `super().execute(statement, ...)` — SQLAlchemy
+  `Session.execute()`, called via `super()`, which has no receiver name at
+  all to evaluate. Real (if already weak-signal: `statement` was a bare
+  parameter, `uncertain` either way).
+- **Alembic, 3 removed:** `cls.execute(...)`,
+  `operations.migration_context.impl.execute(...)`,
+  `self.get_context().execute(...)` — Alembic's actual "run this DDL"
+  entry points. Real.
+
+**Why this isn't a bug to patch further.** `self.execute(x)` is
+syntactically identical whether `self` is Django's `SchemaEditor`,
+SQLAlchemy's `Engine`, or peewee's `Query` — nothing in the AST at the call
+site distinguishes "a thin wrapper around a real cursor" from "an unrelated
+object that happens to define its own `execute` method." peewee's own false
+positives use exactly the same receiver names this section's real losses
+use (`self`, `database`) — `peewee.py:2210`'s `self.execute(database)` and
+Django's `schema.py:167`'s `self.execute(sql)` are the same shape by every
+signal available to single-file AST analysis. Broadening the convention
+list to recover Django's `self`/`schema_editor` cases would readmit
+peewee's `self.execute(database)` right back in; there is no name-based
+line to draw between them. Resolving it for real would require knowing
+what class `self` is bound to - interprocedural, type-aware analysis this
+tool doesn't do, for the same reason described as out of scope in the
+README's original scope-wall section.
+
+**Net read on the trade.** The patch removes one confirmed, clean
+false-positive category (24 peewee findings, 5 Django CLI-dispatch
+findings — 29 total) at the cost of 94 real-but-already-weak-signal
+`uncertain` findings elsewhere, concentrated in exactly the kind of
+generic-receiver DB-wrapper method (`self.execute()`, `super().execute()`)
+that turns out to be common across mature ORMs and frameworks, not just
+peewee. Whether that trade is worth it depends on what a user does with
+`uncertain` output: if `uncertain` is read as "worth a quick look," this
+patch makes that bucket smaller and more precise in peewee specifically,
+but meaningfully less complete in Django, SQLAlchemy, dataset, and Alembic.
+This document does not resolve that judgment call in inlet's favor — it
+reports the exact size and shape of the trade so a user (or a future
+version) can.
+
+**Group A is unchanged, deliberately.** The 5 CVE packages were not
+re-scanned. None of the four misses documented in §2 involved the
+`generic_execute`/`django_raw`/`django_extra` false-positive pattern this
+patch addresses — three were idiom-coverage misses (`where_in`,
+`field.like()`, `hook.get_records()` never call anything named `execute`/
+`raw`/`extra`/`text` at all) and one (Django's `CVE-2022-28346`) was a
+scope-wall miss unrelated to receiver naming. The Archery partial
+(`CVE-2023-30556`, `oracle.py:1347`) was already `cursor.execute(...)` with
+receiver `cursor` — squarely inside the convention list — so its
+`uncertain` classification is unaffected by this patch; it remains
+`uncertain` for the same `try:`-block resolution reason documented in §2,
+not because of receiver evidence. Re-running Group A would not change any
+of the five verdicts, and re-scanning it here would risk implying this
+patch touched the structural wall, which it did not.
