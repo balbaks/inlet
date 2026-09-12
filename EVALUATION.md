@@ -759,3 +759,247 @@ noise instead of unrecoverable silence, for everyone, not just for peewee.
 of this story (v0.1.0, v0.1.1, and v0.1.2 all agree on them) — this was
 never about those two verdicts. The entire episode is contained to how
 `uncertain` candidates are reported, and v0.1.2 reports all of them.
+
+## §7: Reference comparison — Semgrep on the same corpus
+
+Everything above measures `inlet` in isolation. A 0/5 CVE-hit rate and a
+false-positive count on Group B mean nothing to a reader without something
+to compare them against. This section runs Semgrep — a widely-used,
+community-maintained static analysis tool, not a competitor `inlet` is
+trying to beat — against the identical 15-package corpus from §1–§2, using
+its current public registry rulesets, and reports the comparison exactly
+as it came out. No claim below is asserted without the underlying Semgrep
+output having been read in this session, the same standard §1 sets for the
+CVE claims themselves.
+
+### Methodology and a registry-drift finding worth stating up front
+
+Semgrep 1.177.0, unauthenticated CLI, run on 2026-09-12/13. The task
+suggested checking Semgrep's *current* registry rather than assuming rule
+names from memory — that check turned up something worth reporting before
+any corpus results: naively running the two packs an informed guess would
+reach for first, `p/python` and `p/sql-injection`, against a plain
+`cursor.execute(f"SELECT * FROM t WHERE name = '{name}'")` probe (no
+Django/Flask/SQLAlchemy involved) produces **zero findings** under either
+pack alone, unauthenticated. That is not because those packs are empty —
+fetching their actual rule manifests from `https://semgrep.dev/c/p/python`
+confirms both nominally contain multiple SQL-injection rules — but because
+those rules are framework/driver-specific (Django `.raw()`/`.extra()`,
+Flask/SQLAlchemy taint sources) and none of them match a bare,
+un-frameworked `.execute()` call. The one rule that *would* catch that
+shape,
+`python.lang.security.audit.formatted-sql-query.formatted-sql-query`, is
+absent from `p/python`'s and `p/sql-injection`'s active rule set entirely;
+it lives in `p/bandit` and `p/default`. Similarly,
+`python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query`
+is only in `p/default` among the packs checked. Verified directly:
+fetching all eight candidate packs' raw YAML and grepping rule IDs,
+cross-checked against which rules actually fired on targeted probes for
+each framework shape (Django `.raw()`/`.extra()`, SQLAlchemy `text()`).
+
+**Consequence for method:** this evaluation runs the union of seven packs
+— `p/python`, `p/security-audit`, `p/sql-injection`, `p/django`,
+`p/flask`, `p/bandit`, `p/default` — rather than the two names an informed
+guess reaches for first, specifically because no single commonly-suggested
+pack name covers the SQL-injection-relevant rules this corpus needs.
+Results below are filtered to a 23-rule allowlist of the SQL-injection-
+specific rule IDs actually present across those seven packs' manifests —
+see [`semgrep_reference/sql_rule_allowlist.txt`](semgrep_reference/sql_rule_allowlist.txt)
+for the full list and [`semgrep_reference/findings_by_package.txt`](semgrep_reference/findings_by_package.txt)
+for every allowlisted finding, per package, that this section's numbers
+are drawn from — excluding two `python.sqlalchemy.performance.*` rules
+that share the "sql" substring but are performance advice, not security
+findings. `p/default`'s remaining
+~1050 rules (crypto, XSS, Terraform, other languages) were left enabled
+during the scan — harmless, since they don't match Python SQL shapes —
+and excluded post-hoc by the allowlist rather than by a narrower
+`--config`, so the filtering step itself is inspectable rather than baked
+into an opaque command line.
+
+**A second, more consequential methodology finding, also from checking
+actual behavior rather than assuming it:** Semgrep's bundled default
+`.semgrepignore` silently excludes `tests/`-named directories from a
+directory scan, with no warning printed unless `--verbose` is passed. This
+was caught, not assumed: an initial pass produced zero findings in
+aiosqlite, where §2's inlet review documented 3 `concatenated` hits, all
+three inside `aiosqlite/tests/perf.py` and `aiosqlite/tests/smoke.py`.
+`inlet scan` applies no such exclusion — its LOC-scanned totals in §2
+already include test trees (Django's 130K+ LOC figure would be
+impossible otherwise). Comparing a tool that scans test code against one
+that's silently skipping it would be a corpus mismatch, not a tool
+comparison. Fixed by passing the (internal/experimental, but verified
+directly) `--x-ignore-semgrepignore-files` flag, confirmed before and
+after via aiosqlite's scanned-file count (5 → 10 files) and finding count
+(0 → 6 in the SQL-relevant allowlist, exactly matching the 3 test-file
+lines already known from §2 plus 3 more from the broader rule union). All
+results below use this flag, on all 15 packages.
+
+**Hit / miss / partial** uses the same definitions as §1: a hit lands
+Semgrep output on the specific verified vulnerable line; a miss produces
+no finding anywhere near it; a partial would be a finding on the right
+line carrying a materially weaker signal. Semgrep has no verdict-downgrade
+mechanism analogous to inlet's `uncertain`, so "partial" only applies here
+if a real quality difference shows up in practice — see Archery, below.
+
+### Group A results
+
+| Package | CVE | inlet verdict (§2) | Semgrep hit/miss | Notes |
+|---|---|---|---|---|
+| Django 3.2.12 | CVE-2022-28346 | MISS | **MISS** | Zero findings within several lines of `django/db/backends/utils.py:82/84` (the generic execute call inlet also only reached generically) or the alias-check region of `query.py`/`compiler.py`. Nearby `custom-expression-as-sql`/`avoid-raw-sql` hits in `compiler.py`/`query.py` (query.py:273, query.py:1080) are unrelated `sql % params` plumbing, confirmed by reading the flagged lines directly — not the alias-injection logic. |
+| Apache Superset 2.1.2 | CVE-2023-49736 | MISS | **MISS** | Zero findings anywhere in `superset/jinja_context.py`. Same root cause as inlet: `where_in` never calls anything spelled `execute`/`raw`/`extra`/`text`, and none of Semgrep's rules key on hand-rolled string-quoting helper functions either. |
+| Tortoise ORM 0.16.5 | CVE-2020-11010 | MISS | **MISS** | Zero findings in `tortoise/filters.py`. The only findings in the whole package are two unrelated f-string `PRAGMA` statements in `backends/*/client.py`. `field.like()` never reaches a recognized call, same as for inlet. |
+| Archery 1.9.0 | CVE-2023-30556 | PARTIAL (right line, downgraded to `uncertain`) | **HIT** | `sql/engines/oracle.py:1347` (`cursor.execute(create_task_sql)`) is flagged by `formatted-sql-query` (WARNING) and `sqlalchemy-execute-raw-query` (ERROR, mislabeled — Archery doesn't use SQLAlchemy, but the shape match is correct). No verdict downgrade: Semgrep pattern-matches the f-string-into-`.execute()` shape directly and isn't defeated by the `try:`-block nesting that broke inlet's same-function name resolution here (§2's documented Wall-adjacent bug). |
+| Airflow common-sql provider 1.24.0 | CVE-2025-30473 | MISS | **MISS** | Literally zero findings of any kind, any rule, anywhere in the package. `hook.get_records()` never calls anything named `execute`/`raw`/`extra`/`text`, and no Semgrep rule in the seven-pack union keys on Airflow's DB-hook vocabulary either. |
+
+**Semgrep: 1 hit, 0 partial, 4 misses, out of 5 — inlet: 0 hits, 1
+partial, 4 misses.** The headline number moves by exactly one case
+(Archery), and it moves because of a mechanism difference, not a coverage
+difference: Semgrep isn't attempting inlet's kind of local-scope name
+resolution at all, so it has nothing for a `try:` block to defeat. On the
+other four — the ones that matter more, because they're where idiom-name
+coverage rather than a resolution bug is the actual wall — **Semgrep
+misses the identical four CVEs `inlet` misses, for the identical
+underlying reason**: Django, Superset, Tortoise, and Airflow all route the
+vulnerable string through a framework abstraction (`SQLCompiler`,
+a Jinja macro, `field.like()`, `hook.get_records()`) that is never spelled
+`execute`/`raw`/`extra`/`text` at the point the injection actually
+happens, or — Django's case specifically — assembles the vulnerable value
+across enough functions and files that no single-file, non-interprocedural
+tool was ever going to reach it. This is stated plainly because it's the
+single most load-bearing finding in this section: `inlet`'s README names
+"idiom-name coverage" as Wall 2 and treats it as `inlet`'s own documented
+limit. A ruleset built and maintained by a much larger team, over years,
+hits the *same* wall on the *same* four real-world CVEs. That doesn't
+excuse `inlet`'s gap — but it reframes it: this isn't a gap `inlet`
+specifically failed to close, it's a shared, structural blind spot of
+pattern/AST-based SQL-injection detection in general, once the vulnerable
+code lives inside a framework's own abstraction over "run this SQL."
+
+### Group B results — noise-floor comparison
+
+Semgrep has no `uncertain`-equivalent category — every finding it reports
+is a confident pattern match at whatever severity the rule carries; there
+is no "I see a DB call here but can't resolve the query text" signal. That
+makes a clean side-by-side count somewhat apples-to-oranges, flagged here
+rather than smoothed over:
+
+| Package | inlet `concatenated` / `uncertain` (current, §2/§6) | Semgrep SQL-relevant findings (allowlisted) | Notes |
+|---|---|---|---|
+| SQLAlchemy | 26 / 421 | 49 | Roughly 2× inlet's `concatenated` count, a small fraction of `concatenated`+`uncertain`. See discussion below. |
+| peewee | 8 / 33 | 16 | Comparable order of magnitude to inlet's real signal once the ~24 naming-collision false positives §2/§5 already identified are set aside. |
+| records | 0 / 6 | **0** | Semgrep silent; inlet's 6 `uncertain` findings are the confirmed-real `self._conn.execute(text(query).bindparams(**params))` pattern (§2) — a genuine DB call whose text is a function parameter. |
+| dataset | 0 / 11 | **0** | Same shape as records: `self.executable.execute(...)` with an unresolvable argument. Semgrep has no rule that fires on an unresolved-argument `.execute()` call absent a recognized taint source. |
+| SQLModel | 0 / 3 | **0** | `super().execute(statement, ...)` — no receiver name, no taint source Semgrep's rules recognize. |
+| aiosqlite | 3 / 2 | 6 | The 6 are the *same 3 lines* as inlet's 3 `concatenated` hits (`tests/perf.py:174`, `:187`, `tests/smoke.py:459`), each matched twice — once by `formatted-sql-query`, once by `sqlalchemy-execute-raw-query` (mislabeled; aiosqlite doesn't use SQLAlchemy). Not 6 independent findings. Neither tool found anything at `aiosqlite/core.py`'s two genuinely `uncertain` lines. |
+| djangorestframework | 0 / 0 | 4 | 2 lines (`tests/conftest.py:151`, `:156`), each matched twice by the same rule pair as aiosqlite above — not DRF's own filtering/ordering code. Both tools agree DRF's actual library code has zero raw-SQL surface. |
+| Flask-SQLAlchemy | 0 / 4 | **0** | Same "unresolved argument, no taint source" gap as records/dataset/SQLModel. |
+| Alembic | 0 / 11 | 9 | All 9 are inside `tests/`, not Alembic's own DDL entry points (`cls.execute()`, `operations.migration_context.impl.execute()`) that §5/§6 identified as inlet's real (if low-confidence) `uncertain` findings — Semgrep found none of those. |
+| Django (patched) 5.1.3 | 76 / 81 | 443 | Roughly 3× inlet's `concatenated`+`uncertain` combined. Dominated by `custom-expression-as-sql` (171 hits) in `compiler.py`'s SQL-expression-node classes, `sqlalchemy-execute-raw-query` (150, all mislabeled — Django doesn't use SQLAlchemy), `formatted-sql-query` (72), and `avoid-raw-sql` (50) — not manually reviewed to the same per-finding depth §2 applied to inlet's Django sample; reported as a raw count, not audited as a false-positive rate the way §2's inlet numbers were. |
+
+**The one clear, consistent pattern across Group B: for four packages
+(records, dataset, SQLModel, Flask-SQLAlchemy) Semgrep reports nothing at
+all, while inlet's `uncertain` bucket reports a combined 24 findings that
+§2 already manually confirmed are real DB-execute call sites, not noise.**
+This isn't inlet finding a vulnerability Semgrep missed — none of those 24
+are confirmed exploitable, and inlet doesn't claim they are either. It's a
+structural consequence of what each tool's rule model even attempts:
+Semgrep's non-taint rules require the query text to be syntactically
+visible (a literal, f-string, `%`-format, or concatenation) *at the call
+site*; when it's a bare parameter or attribute access, there is nothing
+for a pattern rule to match, and none of these four packages hand Semgrep
+a recognized taint source (`request.*`, a named DB driver call) to chain
+through instead. `inlet`'s `uncertain` verdict exists specifically to
+report exactly this case — "real DB call, can't resolve the argument" —
+as an honest, visible lead rather than staying silent. On this corpus,
+that category is doing real, non-overlapping work no Semgrep rule in the
+seven-pack union attempts.
+
+The reverse also holds, and is worth naming with equal weight: Semgrep's
+`avoid-sqlalchemy-text` rule fires on *any* `sqlalchemy.text()` usage as a
+blanket "avoid this API" style warning, regardless of whether the call is
+safely parameterized via `.bindparams()` — a coarser signal than inlet's
+`concatenated`/`parameterized` distinction, which specifically separates
+safe from risky `text()` usage rather than flagging the API itself. Some
+of Semgrep's counts above include this style-level signal, not a
+concatenation finding; inlet's `concatenated` bucket does not have an
+equivalent category and would not count a safely-parameterized `text()`
+call at all.
+
+### Structural differences worth naming, beyond the numbers
+
+- **Confidence model.** Semgrep findings carry a severity
+  (INFO/WARNING/ERROR) assigned per-rule by the rule's author; inlet's
+  verdicts (`parameterized`/`concatenated`/`uncertain`) are assigned per
+  call site by what could and couldn't be locally resolved. These answer
+  different questions — "how bad is this pattern, in general" vs. "could
+  I tell what this specific expression actually is" — and neither
+  subsumes the other.
+- **Taint vs. shape.** A meaningful fraction of Semgrep's nominal Python
+  SQLi rules (the Flask/Django/AWS-Lambda `tainted-sql-string` family) are
+  taint-tracking rules keyed on a web-request or event-payload source
+  reaching a SQL sink. That's a different, complementary detection
+  strategy from both inlet's and Semgrep's own shape-based rules
+  (`formatted-sql-query`, `sqlalchemy-execute-raw-query`) — and it is
+  structurally unable to fire on library-internal code with no
+  `request`/event object in scope, which is most of this corpus. This
+  corpus, being mostly ORM/driver internals rather than application view
+  code, does not exercise Semgrep's taint rules in a way that's fair to
+  either count for or against them.
+- **Cross-function reach.** Neither tool solved Django's CVE-2022-28346,
+  and for the same practical reason — the vulnerable value crosses
+  several functions and files before reaching a recognizable sink. Semgrep
+  *can* do cross-file/interfile taint analysis (`--pro`, paid tier, not
+  exercised here since the task scope is the public ruleset), which is a
+  capability inlet has no plans to build (README's "Walls" section). This
+  evaluation used the free/public CLI only, per the task's own framing —
+  a paid or Pro-enabled Semgrep run might close some of this specific gap;
+  that was not tested.
+- **No fuzzy/behavioral verification in either tool.** Both tools are
+  static and pattern/rule-based; neither executes code or proves
+  exploitability. This evaluation does not compare either tool against an
+  execution-based approach.
+
+### Fairness caveats, stated plainly
+
+- **Maintenance-effort asymmetry.** Semgrep's public registry rules are
+  written and maintained by many contributors over several years; `inlet`
+  is a single-author v0.1.0 built in about a week. That Semgrep *also*
+  misses the same four Group A CVEs is more informative because of this
+  gap, not despite it — but the gap itself means a "tie" on Group A is not
+  a neutral result: it took `inlet` a week to reach parity with a
+  much older, more resourced project on this specific slice, and Semgrep
+  still has categories (taint tracking, a much broader idiom vocabulary,
+  Pro-tier interfile analysis) that `inlet` doesn't attempt at all.
+- **Unauthenticated CLI only.** This run did not use `semgrep login`. Per
+  the rulesets' own on-screen messaging ("need more rules? `semgrep login`
+  for additional free Semgrep Registry rules"), an authenticated free
+  account may unlock rules not exercised here. This evaluation did not
+  create or use a Semgrep account, so this ceiling is unverified in
+  either direction — stated as an open question, not assumed answered.
+- **Rule-set selection was a judgment call, made transparent, not
+  hidden.** The seven-pack union and the 23-rule post-hoc allowlist were
+  arrived at empirically (per the registry-drift finding above) rather
+  than picked from a single canonical "the" Semgrep SQLi config, because
+  no single commonly-suggested pack name covers this corpus's needs. A
+  different, equally defensible selection could shift the Group B counts;
+  the Group A hit/miss results (checked against specific known lines, not
+  aggregate counts) are far less sensitive to this choice.
+- **Depth of manual review is not equal.** §2's inlet numbers rest on
+  every `concatenated` finding being read in full (or, for the two
+  largest packages, read to a documented point of coverage). This
+  section's Semgrep numbers are reported as raw allowlisted counts,
+  cross-checked against specific known lines for Group A, but not
+  manually read finding-by-finding for Group B the way §2 did for inlet.
+  Django's 443 in particular should be read as "here is the number," not
+  "here is the false-positive rate" — that would require the same
+  per-finding review §2 gives inlet, which this section does not claim to
+  have done.
+- **`inlet`'s `uncertain` category has no Semgrep equivalent, in either
+  direction.** It is real signal Semgrep's rule model doesn't attempt
+  (records/dataset/SQLModel/Flask-SQLAlchemy, above) — but it is also,
+  per §3/§5's own honest accounting, sometimes noise (peewee's naming
+  collisions). Crediting `inlet` for the records/dataset/SQLModel result
+  without also carrying forward §3's own finding that the same category
+  is inflated by non-SQL `.execute()` name collisions elsewhere would be
+  cherry-picking inlet's better result and burying its own documented
+  weakness in the same bucket.
